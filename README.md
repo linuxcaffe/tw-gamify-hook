@@ -1,7 +1,7 @@
-- Project: https://github.com/linuxcaffe/tw-gamify
-- Issues:  https://github.com/linuxcaffe/tw-gamify/issues
+- Project: https://github.com/linuxcaffe/tw-gamify-hook
+- Issues:  https://github.com/linuxcaffe/tw-gamify-hook/issues
 
-# tw-gamify
+# tw-gamify-hook
 
 Taskwarrior: The Game. Every task action earns or costs points, and so does every task you ignore. Spend the points on prizes you choose, under the supervision of a disappointed grandmother.
 
