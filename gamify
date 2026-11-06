@@ -1,0 +1,1291 @@
+#!/usr/bin/env python3
+"""
+gamify - Taskwarrior: The Game. Points, ranks, prizes and a disappointed grandmother.
+
+  gamify               the status board
+  gamify log [N]       the last N ledger entries (default 20): what you got, and why
+  gamify shop          the prizes, and what you can afford
+  gamify redeem <key>  buy a prize (honour system; the purchase is on the record)
+  gamify pause [DAYS]  no penalties for a while (default 7), e.g. a holiday
+  gamify resume        back to work
+  gamify -e            edit gamify.rc ($VISUAL, $EDITOR, else vi)
+  gamify --line        one line, for a prompt or a status bar
+  gamify --json        everything, for a client
+  gamify --refresh     judge any finished days and renew the urgency snapshot
+                       (run detached by the on-launch hook)
+  gamify -v            version
+
+Version: 0.1.0
+"""
+import json
+import os
+import random
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+VERSION = '0.1.0'
+TASK_DIR = Path(os.environ.get('TW_TASK_DIR', str(Path.home() / '.task')))
+RC_FILE = TASK_DIR / 'config' / 'gamify.rc'
+LOCAL_RC = TASK_DIR / 'local.rc'
+LEDGER = TASK_DIR / 'config' / 'gamify-ledger.jsonl'
+SNAPSHOT = TASK_DIR / 'logs' / 'gamify-snapshot.json'
+RECAP = TASK_DIR / 'logs' / 'gamify-recap.txt'
+LOCK = TASK_DIR / 'logs' / 'gamify.lock'
+
+# Every key the code reads, with its default. gamify.rc documents them all (a test keeps that true).
+DEFAULTS = {
+    'enabled': 'yes',
+    'voice': 'grandmother',
+    'volume': 'normal',            # off | quiet | normal | loud
+    'zero-quip-chance': '0.2',
+    'box': 'double',               # double | single | ascii
+    'points.done': '10',
+    'points.quick': '2',
+    'points.log': '2',
+    'points.focus': '3',
+    'points.regicide': '15',
+    'points.add-filed': '1',
+    'points.file': '1',
+    'points.delete-stale': '2',
+    'points.delete-overdue': '-5',
+    'points.push': '-1',
+    'points.push-max': '-8',
+    'points.rot': '-2',
+    'points.behind': '-1',
+    'points.zombie': '-2',
+    'points.fossil': '-1',
+    'points.blank': '-5',
+    'points.clean': '5',
+    'points.welcome': '25',
+    'factor.early': '1.5',
+    'factor.ontime': '1.25',
+    'factor.late-decay': '0.1',
+    'factor.late-floor': '0.25',
+    'factor.moon': '2',
+    'urgency-scale': '20',
+    'urgency-max': '3',
+    'regicide-min-urgency': '5',
+    'quick-minutes': '5',
+    'stale-days': '60',
+    'fossil-days': '90',
+    'very-late-days': '7',
+    'use-scheduled': 'yes',
+    'cap.add': '10',
+    'cap.file': '5',
+    'cap.log': '10',
+    'cap.rot-days': '30',
+    'cap.penalty-day': '-25',
+    'amnesty-days': '14',
+    'backfill-days': '14',
+    'rest-on': 'holidays',         # holidays, mine, moon, season (tw-events' files), comma-separated
+    'moon-bonus': 'yes',
+    'streak-counts-log': 'yes',
+    'skip-tags': 'noscore',
+    'xp-rate': '1',
+}
+
+DEFAULT_RANKS = [
+    (0, 'Intern of Intentions'),
+    (100, 'Junior Procrastination Analyst'),
+    (250, 'Apprentice Box-Ticker'),
+    (500, 'Keeper of the Sticky Note'),
+    (900, 'Deputy Undersecretary of Getting Round To It'),
+    (1500, 'Senior Vice President of Done-ish'),
+    (2500, 'Regional Manager of Actually Doing It'),
+    (4000, 'Archduke of the Empty Inbox'),
+    (6500, 'Field Marshal of the Follow-Through'),
+    (10000, 'Grand Vizier of Done'),
+    (16000, 'Taskmaster Emeritus'),
+    (25000, 'The One Who Finished'),
+]
+
+DEFAULT_PRIZES = {
+    'donut': (150, '🍩 One (1) sweet treat'),
+    'youtube': (100, '📺 One hour of YouTube, guilt-free'),
+    'nap': (250, '😴 A nap, on purpose'),
+}
+
+ICONS = {
+    'early': '⚡', 'ontime': '🎯', 'done': '✅', 'late': '🐌', 'verylate': '🦴', 'quick': '🪶',
+    'regicide': '👑', 'add': '🧹', 'bare': '🌫️', 'log': '📝', 'file': '🗂️', 'mercy': '⚰️',
+    'evidence': '🏃', 'delete': '🗑️', 'push': '💃', 'rev': '↩️', 'prize': '🛒', 'genesis': '🎁',
+    'rot': '🍂', 'behind': '🐢', 'zombie': '🧟', 'fossil': '🦕', 'blank': '💤', 'clean': '🏆',
+    'rule': '📜', 'pause': '🏖️', 'resume': '🔔', 'moon': '🌕', 'level': '🎉', 'streak': '🔥',
+}
+
+SWEEP_KINDS = {'rot', 'behind', 'zombie', 'fossil', 'blank', 'clean', 'rule'}
+STREAK_MILESTONES = (3, 7, 14, 30, 60, 100, 200, 365)
+
+# ── Voices ────────────────────────────────────────────────────────────────────
+# Lines for an event; {d} is the task. `gamify.say.<voice>.<event>.<n>` in gamify.rc adds more.
+
+VOICES = {
+    'grandmother': {
+        'early': ["Early! I'll tell everyone at church.", "Before it was due, and you didn't even have to be asked twice.",
+                  "Look at you. Your grandfather was never early for anything, including me."],
+        'ontime': ["On the day. That's how it's done, dear.", "Right on time. Have a biscuit.",
+                   "Punctual. I knew there was some of my side in you."],
+        'done': ["Good. Now stand up straight.", "There. Was that so hard?", "Well done, dear. Don't let it go to your head."],
+        'late': ["Better late than never, I always say. I say it a lot, around you.", "It got done. We won't talk about when.",
+                 "Late, but you came. Like your uncle at the wedding."],
+        'verylate': ["Oh, THAT one. I thought it had passed away.", "I'd given up asking. I'd started telling people you were busy.",
+                     "This was due when I still had my own hip."],
+        'quick': ["Added it and finished it in one breath? Very clever. Small biscuit.",
+                  "I can see what you're doing, dear. I raised three of you."],
+        'regicide': ["The big one! I always said you had it in you. I said it quietly.",
+                     "Your most pressing thing, gone. Sit down, I'll fetch the good plates."],
+        'add': ["A proper label and a date. You'd be surprised how few people bother.", "Neatly filed. I could eat off this list."],
+        'bare': ["'{d}'. And what is that supposed to mean, dear?", "No date, no project. Just vibes, as your cousin says."],
+        'log': ["Done already and only telling me now? Well, I'm pleased, I suppose.", "Noted. I'll take your word for it, thousands wouldn't."],
+        'file': ["Tidying up. Lovely. Now do your room.", "A place for everything."],
+        'mercy': ["It had a good long life on your list. Let it go, dear.", "That one wasn't going to happen, was it. Good of you to admit it."],
+        'evidence': ["I saw that. It was overdue and now it's 'gone'. I saw that.", "Throwing it away doesn't mean you did it, dear. I do know how this works."],
+        'delete': ["Mm.", "Another one gone. You do clear out a lot, don't you? I've counted."],
+        'push': ["Next week, is it. It's always next week.", "Moved it again. No, no, I'm not upset. I'm only asking.",
+                 "You know I won't be around forever to watch you move that date."],
+        'rev': ["Changed your mind? Then I'll have that back, thank you.", "Oh, it wasn't done after all. I'll just take these back."],
+        'prize': ["Go on then, you earned it. Don't spoil your dinner.", "A treat! In my day it was an orange, and we were glad of it."],
+        'broke': ["With what money, dear? You're {need} short. Maybe finish something.", "Not on your balance. Do a task and we'll see."],
+        'level': ["A promotion! {rank}! I don't know what that is, but I've told the neighbours.",
+                  "{rank}. Your grandfather would have pretended not to be proud."],
+        'streak': ["{n} days in a row. I'm not crying, it's the onions.", "{n} days running! Don't stop now, people are watching. I'm people."],
+        'recap_bad': ["I went through your list while you slept. We need to talk.", "I'm not angry. I just thought you'd have got to these by now."],
+        'recap_mixed': ["Some good, some not. I've kept a note of both.", "I've seen better days. I've seen worse. Mostly better."],
+        'recap_good': ["Nothing overdue. I checked twice. I'm almost at a loss for words.", "All in order. Have a sweet, you can reach the tin now."],
+        'welcome': ["There you are. Sit down, dear. I'm keeping score now. Everything before today is forgiven, for a little while."],
+    },
+    'coach': {
+        'early': ["AHEAD OF THE CLOCK! That's what we train for!", "Early! That's championship stuff!"],
+        'ontime': ["Right on the whistle! Beautiful!", "On time, on target!"],
+        'done': ["That's a W! Next play!", "Good rep! Keep moving!"],
+        'late': ["Still counts! Shake it off!", "Late, but you finished the race!"],
+        'verylate': ["Comeback of the season!", "Nobody thought you'd get back on the field for that one!"],
+        'quick': ["Easy rep. Light weight. Go find a heavy one.", "Warm-up set. Doesn't count for much."],
+        'regicide': ["YOU TOOK DOWN THE BIG ONE! GAME BALL!", "That's the top seed, DOWN!"],
+        'add': ["Good film study. Plan's on the board.", "Playbook's looking sharp."],
+        'bare': ["'{d}'? What's the play, champ?", "That's not a plan, that's a hope."],
+        'log': ["I'll take it! Put it on the board!", "Off-the-books hustle!"],
+        'file': ["Good fundamentals.", "Clean locker room!"],
+        'mercy': ["Cut from the roster. Tough call, right call.", "Sometimes you release a veteran."],
+        'evidence': ["That's forfeiting, not winning!", "You can't delete the scoreboard!"],
+        'delete': ["Roster move.", "Next man up."],
+        'push': ["You're benching it AGAIN?", "Rescheduling the game doesn't win it!"],
+        'rev': ["Play's under review. Points come off.", "Overturned on replay!"],
+        'prize': ["Hit the showers! You earned it!", "Team dinner's on you!"],
+        'broke': ["Not in the budget! {need} short! Back on the field!", "Earn it! {need} to go!"],
+        'level': ["Called up to {rank}! Big leagues!", "{rank}! Sign the contract!"],
+        'streak': ["{n}-DAY WIN STREAK!", "{n} straight! Don't look at the scoreboard, keep playing!"],
+        'recap_bad': ["Rough film this morning. We go again.", "We left points on the field."],
+        'recap_mixed': ["Split decision. We can build on that.", "Some good tape, some bad tape."],
+        'recap_good': ["Clean game! No overdue! Love it!", "Shutout!"],
+        'welcome': ["Welcome to the team! Slate's clean, clock's running!"],
+    },
+    'sergeant': {
+        'early': ["Early. Acceptable.", "Ahead of schedule. Don't get comfortable."],
+        'ontime': ["On time is the MINIMUM. Noted.", "Mission complete at the appointed hour."],
+        'done': ["Objective taken. Move out.", "One down. Eyes front."],
+        'late': ["LATE. In the field that gets people hurt. Points reduced.", "You call that on time? Drop and do another."],
+        'verylate': ["This order went out in another WAR.", "Historians will study this delay."],
+        'quick': ["You added it just to complete it? Nice try, recruit.", "That's not a mission, that's a sandwich."],
+        'regicide': ["High-value target ELIMINATED.", "Top of the board, neutralized. Outstanding."],
+        'add': ["Orders filed correctly.", "Properly documented. Carry on."],
+        'bare': ["'{d}'? WHAT is that, recruit? Where's your project?", "Vague orders. Vague results."],
+        'log': ["After-action report received.", "Filed. Next time report BEFORE the mission."],
+        'file': ["Barracks inspection passed.", "Squared away."],
+        'mercy': ["Stood down with honours.", "Mission scrubbed. Long overdue."],
+        'evidence': ["DESERTION. It was overdue and you ran.", "You don't get to shred your orders."],
+        'delete': ["Scrubbed.", "Struck from the roster."],
+        'push': ["ANOTHER delay? Who authorized this?", "Retreat is not a schedule."],
+        'rev': ["Mission NOT complete. Points confiscated.", "False report. Pay it back."],
+        'prize': ["Shore leave granted. Be back by 0600.", "Rations issued."],
+        'broke': ["DENIED. You're {need} short.", "No leave. {need} more, recruit."],
+        'level': ["Promoted to {rank}. Don't make me regret it.", "{rank}. Report for duty."],
+        'streak': ["{n} days without incident.", "{n} consecutive days. Keep marching."],
+        'recap_bad': ["Morning inspection: UNACCEPTABLE.", "I walked your lines last night, recruit."],
+        'recap_mixed': ["Inspection: mixed. Fix it.", "Some of you may survive."],
+        'recap_good': ["Inspection passed. No stragglers.", "Lines are clear. Carry on."],
+        'welcome': ["Listen up. You're enlisted. Past offences waived, for now."],
+    },
+    'commentator': {
+        'early': ["AND THEY'RE OFF EARLY! What a start!", "Ahead of the pace! The crowd did not expect this!"],
+        'ontime': ["Right on the line! Photo finish!", "Exactly on the day, textbook!"],
+        'done': ["Into the back of the net!", "And that's another one on the board!"],
+        'late': ["Deep into stoppage time, but it counts!", "A late, late finish!"],
+        'verylate': ["They'd stacked the chairs, turned off the floodlights, and NOW it goes in!", "You simply cannot believe the timing, and not in a good way."],
+        'quick': ["A tap-in from one yard. Technically a goal.", "The replay will not be shown."],
+        'regicide': ["THE CHAMPION IS DOWN! THE CHAMPION IS DOWN!", "A monumental upset at the top of the table!"],
+        'add': ["A well-drilled entry to the fixture list.", "Fine bit of organization there."],
+        'bare': ["'{d}', and the commentary box is baffled.", "No idea what that is, Jim, and neither do they."],
+        'log': ["Scored while the cameras were off! We'll allow it!", "Retrospectively awarded!"],
+        'file': ["Quiet, tidy, unglamorous. The purists love it.", "Good work off the ball."],
+        'mercy': ["A long career ends here. Dignified exit.", "Retired, to polite applause."],
+        'evidence': ["Oh, that's a straight red! Overdue and thrown out of the stadium!", "The referee HAS seen that!"],
+        'delete': ["Substituted off.", "And it's gone."],
+        'push': ["Match postponed AGAIN! The fans are livid!", "Fixture rearranged, and the terraces are singing about it."],
+        'rev': ["VAR says no! Goal disallowed!", "Chalked off!"],
+        'prize': ["Lifting the trophy! Scenes!", "A lap of honour, and rightly so!"],
+        'broke': ["The transfer is off! {need} short!", "Financial fair play blocks the deal: {need} short!"],
+        'level': ["Promoted! {rank} next season!", "{rank}! What a career this is turning into!"],
+        'streak': ["{n} on the bounce! Unbeaten!", "{n} days unbeaten! Can anyone stop this run?"],
+        'recap_bad': ["Overnight results, and they make grim reading.", "A dismal evening for the home side."],
+        'recap_mixed': ["Honours even in last night's fixtures.", "A game of two halves."],
+        'recap_good': ["A clean sheet! No overdue!", "Total control from start to finish!"],
+        'welcome': ["And we're LIVE for the opening day of the season!"],
+    },
+}
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def read_rc(path):
+    """gamify.* keys of an rc file, without the prefix. `#` starts a comment, as in taskrc."""
+    out = {}
+    try:
+        for line in path.read_text(encoding='utf-8').splitlines():
+            line = line.split('#', 1)[0].strip()
+            if line.startswith('gamify.') and '=' in line:
+                key, value = line.split('=', 1)
+                out[key.strip()[len('gamify.'):]] = value.strip()
+    except OSError:
+        pass
+    return out
+
+
+class Config:
+    def __init__(self):
+        self.raw = read_rc(RC_FILE)
+        self.raw.update(read_rc(LOCAL_RC))     # a station's own setting wins
+
+    def get(self, key):
+        return self.raw.get(key, DEFAULTS[key])
+
+    def num(self, key):
+        try:
+            return float(self.get(key))
+        except ValueError:
+            return float(DEFAULTS[key])
+
+    def int(self, key):
+        return int(round(self.num(key)))
+
+    def yes(self, key):
+        return self.get(key).lower() in ('yes', 'on', 'true', '1', 'y')
+
+    def skip_tags(self):
+        return {t.strip() for t in self.get('skip-tags').split(',') if t.strip()}
+
+    def prizes(self):
+        found = {}
+        for key, value in self.raw.items():
+            if key.startswith('prize.') and key.endswith('.cost'):
+                name = key[len('prize.'):-len('.cost')]
+                try:
+                    found[name] = (int(value), self.raw.get(f'prize.{name}.label', name))
+                except ValueError:
+                    pass
+        return found or dict(DEFAULT_PRIZES)
+
+    def ranks(self):
+        found = []
+        for key, value in self.raw.items():
+            if key.startswith('rank.'):
+                try:
+                    found.append((int(key[len('rank.'):]), value))
+                except ValueError:
+                    pass
+        return sorted(found) or DEFAULT_RANKS
+
+    def rules(self):
+        """Custom rules: {name: {filter, points, msg, cadence}}."""
+        rules = {}
+        for key, value in self.raw.items():
+            if key.startswith('rule.'):
+                parts = key.split('.')
+                if len(parts) == 3:
+                    rules.setdefault(parts[1], {})[parts[2]] = value
+        return {n: r for n, r in rules.items() if r.get('filter') and r.get('points')}
+
+    def station(self):
+        try:
+            for line in LOCAL_RC.read_text(encoding='utf-8').splitlines():
+                if line.startswith('gittw.device'):
+                    return line.split('=', 1)[1].strip()
+        except (OSError, IndexError):
+            pass
+        return ''
+
+    def say(self, event, **values):
+        """A line in the current voice, or ''."""
+        voice = self.get('voice')
+        lines = list(VOICES.get(voice, {}).get(event, []))
+        prefix = f'say.{voice}.{event}.'
+        lines += [v for k, v in self.raw.items() if k.startswith(prefix)]
+        if not lines:
+            return ''
+        line = random.choice(lines)
+        for key, value in values.items():
+            line = line.replace('{' + key + '}', str(value))
+        return line
+
+
+# ── Dates ─────────────────────────────────────────────────────────────────────
+
+def parse_ts(value):
+    """A Taskwarrior timestamp as an aware local datetime, or None."""
+    try:
+        return datetime.strptime(value, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc).astimezone()
+    except (TypeError, ValueError):
+        return None
+
+
+def local_day(value):
+    moment = parse_ts(value)
+    return moment.date() if moment else None
+
+
+def today():
+    return date.today()
+
+
+# ── Ledger ────────────────────────────────────────────────────────────────────
+# Append-only JSON lines, merged between stations with merge=union. The score is always worked
+# out from it. An entry's id makes a repeat harmless: a sweep on each station charges the same
+# day under the same id, and only the first counts.
+
+def read_ledger():
+    entries, seen = [], set()
+    try:
+        with LEDGER.open(encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('id') not in seen:
+                    seen.add(entry.get('id'))
+                    entries.append(entry)
+    except OSError:
+        pass
+    entries.sort(key=lambda e: e.get('t', 0))
+    return entries
+
+
+def append(entries_new, cfg):
+    if not entries_new:
+        return
+    station = cfg.station()
+    lines = []
+    for entry in entries_new:
+        entry.setdefault('t', int(time.time()))
+        entry.setdefault('day', today().isoformat())
+        if station:
+            entry.setdefault('st', station)
+        lines.append(json.dumps(entry, ensure_ascii=False, separators=(',', ':')))
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LEDGER), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, ('\n'.join(lines) + '\n').encode('utf-8'))
+    finally:
+        os.close(fd)
+
+
+def new_id(kind, uuid=''):
+    return f'{kind}:{uuid[:8]}:{time.time_ns():x}'
+
+
+def entry(kind, coins, cfg, uuid='', desc='', why='', **extra):
+    """A ledger entry. Earnings add XP too; losses and purchases only ever touch coins."""
+    made = {'id': extra.pop('id', None) or new_id(kind, uuid), 'k': kind, 'c': coins,
+            'x': int(round(coins * cfg.num('xp-rate'))) if coins > 0 else 0}
+    if uuid:
+        made['u'] = uuid
+    if desc:
+        made['d'] = desc[:60]
+    if why:
+        made['why'] = why
+    made.update(extra)
+    return made
+
+
+class State:
+    """The ledger, added up."""
+
+    def __init__(self, entries, cfg, snap=None):
+        self.entries = entries
+        self.cfg = cfg
+        self.snap = snap if snap is not None else read_snapshot()
+        self.reversed = {e['rev'] for e in entries if e.get('rev')}
+        counted_log = cfg.yes('streak-counts-log')
+        self.done_days = {e['day'] for e in entries
+                          if e['id'] not in self.reversed and (e['k'] == 'done' or (counted_log and e['k'] == 'log'))}
+        self.pauses = self._pauses()
+        self.coins = self.xp = 0
+        self.live = []
+        for e in entries:
+            # A station that hadn't synced may have charged a blank day the other one worked through
+            if e['k'] == 'blank' and e['day'] in self.done_days:
+                continue
+            self.coins += e.get('c', 0)
+            self.xp += e.get('x', 0)
+            if e['id'] not in self.reversed and e['k'] != 'rev':
+                self.live.append(e)
+        self.genesis = next((e['day'] for e in entries if e['k'] == 'genesis'),
+                            entries[0]['day'] if entries else None)
+        self.streak, self.best = self._streaks()
+
+    def _pauses(self):
+        spans = []
+        for e in self.entries:
+            if e['k'] == 'pause':
+                spans.append([e['from'], e['to']])
+            elif e['k'] == 'resume':
+                yesterday = (date.fromisoformat(e['day']) - timedelta(days=1)).isoformat()
+                for span in spans:
+                    span[1] = min(span[1], yesterday)
+        return spans
+
+    def paused_on(self, day):
+        iso = day if isinstance(day, str) else day.isoformat()
+        return any(a <= iso <= b for a, b in self.pauses)
+
+    def resting_on(self, iso):
+        return iso in self.snap.get('rest', ()) or self.paused_on(iso)
+
+    def _streaks(self):
+        """(current, best): rest and pause days neither count nor break a streak. Today only adds."""
+        if not self.done_days:
+            return 0, 0
+        day = date.fromisoformat(min(self.done_days))
+        now = today()
+        run = best = 0
+        while day <= now:
+            iso = day.isoformat()
+            if iso in self.done_days:
+                run += 1
+            elif day != now and not self.resting_on(iso):
+                run = 0
+            best = max(best, run)
+            day += timedelta(days=1)
+        return run, best
+
+    def rank(self):
+        """(level, title, xp where it starts, xp of the next one or None)."""
+        ranks = self.cfg.ranks()
+        index = 0
+        for i, (need, _) in enumerate(ranks):
+            if self.xp >= need:
+                index = i
+        following = ranks[index + 1][0] if index + 1 < len(ranks) else None
+        return index + 1, ranks[index][1], ranks[index][0], following
+
+    def count_today(self, kind):
+        iso = today().isoformat()
+        return sum(1 for e in self.live if e['k'] == kind and e['day'] == iso and e.get('c', 0) > 0)
+
+    def count_for(self, kind, uuid):
+        return sum(1 for e in self.live if e['k'] == kind and e.get('u') == uuid)
+
+    def latest(self, kinds, uuid):
+        for e in reversed(self.live):
+            if e['k'] in kinds and e.get('u') == uuid:
+                return e
+        return None
+
+    def has_id(self, wanted):
+        return any(e['id'] == wanted for e in self.entries)
+
+
+def read_snapshot():
+    try:
+        return json.loads(SNAPSHOT.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+
+
+# ── Scoring what just happened ────────────────────────────────────────────────
+
+def urgency_factor(uuid, snap, cfg):
+    urgency = snap.get('urgency', {}).get(uuid)
+    if urgency is None:
+        return 1.0
+    return min(cfg.num('urgency-max'), 1 + max(urgency, 0) / max(cfg.num('urgency-scale'), 0.001))
+
+
+def punctuality(task, ended, cfg):
+    """(event, factor) from how the end date compares with due (or scheduled)."""
+    target = local_day(task.get('due'))
+    if target is None and cfg.yes('use-scheduled'):
+        target = local_day(task.get('scheduled'))
+    if target is None or ended is None:
+        return 'done', 1.0
+    days = (ended.date() - target).days
+    if days < 0:
+        return 'early', cfg.num('factor.early')
+    if days == 0:
+        return 'ontime', cfg.num('factor.ontime')
+    factor = max(cfg.num('factor.late-floor'), 1 - days * cfg.num('factor.late-decay'))
+    return ('verylate' if days >= cfg.int('very-late-days') else 'late'), factor
+
+
+def score_done(old, new, state, cfg):
+    uuid = new['uuid']
+    ended = parse_ts(new.get('end')) or datetime.now().astimezone()
+    entered = parse_ts(new.get('entry'))
+    if entered and (ended - entered).total_seconds() < cfg.num('quick-minutes') * 60:
+        return entry('done', cfg.int('points.quick'), cfg, uuid, new.get('description', ''), 'quick', say='quick')
+
+    event, factor = punctuality(new, ended, cfg)
+    snap = state.snap
+    why = [event]
+    if event in ('late', 'verylate') and cfg.yes('moon-bonus') and today().isoformat() in snap.get('moons', ()):
+        factor *= cfg.num('factor.moon')
+        why.append('moon')
+    coins = int(round(cfg.num('points.done') * urgency_factor(uuid, snap, cfg) * factor))
+    started = parse_ts(old.get('start'))
+    if started and (ended - started).total_seconds() < 86400:
+        coins += cfg.int('points.focus')
+        why.append('focus')
+    urgency = snap.get('urgency', {}).get(uuid)
+    if snap.get('top') == uuid and urgency is not None and urgency >= cfg.num('regicide-min-urgency'):
+        coins += cfg.int('points.regicide')
+        why.append('regicide')
+        event = 'regicide'
+    return entry('done', coins, cfg, uuid, new.get('description', ''), '+'.join(why), say=event)
+
+
+def score_add(task, state, cfg):
+    uuid, desc = task['uuid'], task.get('description', '')
+    if task.get('status') == 'completed':
+        coins = cfg.int('points.log') if state.count_today('log') < cfg.int('cap.log') else 0
+        return entry('log', coins, cfg, uuid, desc, say='log')
+    if task.get('project') and (task.get('due') or task.get('scheduled')):
+        coins = cfg.int('points.add-filed') if state.count_today('add') < cfg.int('cap.add') else 0
+        return entry('add', coins, cfg, uuid, desc, 'filed', say='add') if coins else None
+    return {'say': 'bare', 'd': desc, 'c': 0}
+
+
+def score_delete(old, new, state, cfg):
+    uuid, desc = new['uuid'], new.get('description', '')
+    now = datetime.now().astimezone()
+    recurring = any(k in new for k in ('parent', 'rtemplate', 'rindex'))
+    due = parse_ts(old.get('due'))
+    if due and due < now and not recurring:
+        return entry('delete', cfg.int('points.delete-overdue'), cfg, uuid, desc, 'evidence', say='evidence')
+    entered = parse_ts(old.get('entry'))
+    if entered and (now - entered).days >= cfg.int('stale-days') and not recurring:
+        return entry('delete', cfg.int('points.delete-stale'), cfg, uuid, desc, 'mercy', say='mercy')
+    return {'say': 'delete', 'd': desc, 'c': 0}
+
+
+def score_push(old, new, state, cfg):
+    uuid = new['uuid']
+    earlier_pushes = state.count_for('push', uuid)
+    coins = max(cfg.int('points.push') * 2 ** earlier_pushes, cfg.int('points.push-max'))
+    return entry('push', coins, cfg, uuid, new.get('description', ''), f'push #{earlier_pushes + 1}', say='push')
+
+
+def classify(old, new):
+    """What a change from old to new amounts to: done, delete, reopen, push, file, or None."""
+    was, now = old.get('status', 'pending'), new.get('status', 'pending')
+    if now == 'recurring' or was == 'recurring':
+        return None
+    if was in ('pending', 'waiting'):
+        if now == 'completed':
+            return 'done'
+        if now == 'deleted':
+            return 'delete'
+    if was in ('completed', 'deleted') and now in ('pending', 'waiting'):
+        return 'reopen'
+    if was != now and now not in ('pending', 'waiting'):
+        return None
+    old_due, new_due = local_day(old.get('due')), local_day(new.get('due'))
+    if old_due and new_due and new_due > old_due:
+        return 'push'
+    if old_due and not new_due and parse_ts(old.get('due')) < datetime.now().astimezone():
+        return 'push'
+    if any(new.get(k) and not old.get(k) for k in ('project', 'due', 'priority')):
+        return 'file'
+    return None
+
+
+def reversal(original):
+    return {'id': f"rev:{original['id']}", 'k': 'rev', 'rev': original['id'], 'c': -original.get('c', 0),
+            'x': -original.get('x', 0), 'u': original.get('u', ''), 'd': original.get('d', ''),
+            'why': f"undid {original['k']}", 'say': 'rev'}
+
+
+def score_change(old, new, command, state, cfg):
+    """The ledger entry for a modification, a quip-only dict, or None."""
+    uuid = new.get('uuid', '')
+    if command == 'undo':
+        if not uuid or new == old:     # undoing an add: `{}`, or the old task if a hook repaired it
+            original = state.latest(('add', 'log'), old.get('uuid', ''))
+            return reversal(original) if original else None
+        kind = classify(new, old)      # what is being taken back: the same change, seen backwards
+        if kind == 'reopen':           # undoing a reopen isn't an earning event
+            return None
+        kinds = {'done': ('done',), 'delete': ('delete',), 'push': ('push',), 'file': ('file',)}.get(kind)
+        original = state.latest(kinds, uuid) if kinds else None
+        return reversal(original) if original else None
+
+    kind = classify(old, new)
+    if kind == 'reopen':
+        kinds = ('done', 'log') if old.get('status') == 'completed' else ('delete',)
+        original = state.latest(kinds, uuid)
+        return reversal(original) if original else None
+    if set(new.get('tags', ())) & cfg.skip_tags():
+        return None
+    if kind == 'done':
+        return score_done(old, new, state, cfg)
+    if kind == 'delete':
+        return score_delete(old, new, state, cfg)
+    if kind == 'push':
+        return score_push(old, new, state, cfg)
+    if kind == 'file':
+        if state.count_today('file') >= cfg.int('cap.file'):
+            return None
+        coins = cfg.int('points.file')
+        return entry('file', coins, cfg, uuid, new.get('description', ''), say='file') if coins else None
+    return None
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+def signed(number):
+    return f'+{number}' if number > 0 else ('0' if number == 0 else f'−{-number}')
+
+
+def say_line(made, cfg):
+    """One line for an entry, or None."""
+    event = made.get('say', '')
+    coins = made.get('c', 0)
+    quip = cfg.say(event, d=made.get('d', '')) if event else ''
+    icon = ICONS.get(event, ICONS.get(made.get('k', ''), '🎮'))
+    if coins:
+        return f'{icon} {signed(coins)} 🪙  {quip}'.rstrip()
+    return f'{icon} {quip}' if quip else None
+
+
+def fanfares(before, after, cfg):
+    out = []
+    level, title = after.rank()[:2]
+    if level > before.rank()[0]:
+        out.append(f"{ICONS['level']} LEVEL {level}: {title}! {cfg.say('level', rank=title)}".rstrip())
+    if after.streak > before.streak and after.streak in STREAK_MILESTONES:
+        out.append(f"{ICONS['streak']} {cfg.say('streak', n=after.streak) or str(after.streak) + ' days!'}")
+    return out
+
+
+def emit(made, before, after, cfg):
+    """What the user sees for this action, by volume."""
+    volume = cfg.get('volume').lower()
+    if volume == 'off':
+        return []
+    lines = []
+    silent_zero = not made.get('c') and random.random() > cfg.num('zero-quip-chance')
+    if volume != 'quiet' and not silent_zero:
+        line = say_line(made, cfg)
+        if line:
+            lines.append(line)
+    if volume == 'loud' and made.get('c'):
+        lines.append(f"   ⭐ {after.xp} XP · 🪙 {after.coins} · 🔥 {after.streak}")
+    return lines + fanfares(before, after, cfg)
+
+
+def ensure_genesis(state, cfg):
+    """The first entry ever: the welcome gift. Returns the entry, or None if it's there already."""
+    if state.has_id('genesis'):
+        return None
+    return entry('genesis', cfg.int('points.welcome'), cfg, why='amnesty', id='genesis')
+
+
+# ── Hooks ─────────────────────────────────────────────────────────────────────
+
+def nested_call():
+    """True when this task was started by a hook of another task: that's automation, not you."""
+    try:
+        pid = os.getppid()
+        name = None
+        for _ in range(8):
+            with open(f'/proc/{pid}/stat', encoding='utf-8', errors='replace') as handle:
+                stat = handle.read()
+            comm = stat[stat.index('(') + 1:stat.rindex(')')]
+            if name is None:
+                name = comm
+            elif comm == name:
+                return True
+            pid = int(stat[stat.rindex(')') + 2:].split()[1])
+            if pid <= 1:
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+def hook_args(argv):
+    return dict(a.split(':', 1) for a in argv if ':' in a)
+
+
+def run_hook(event, argv):
+    """on-add / on-modify: pass the task through first, whatever else happens."""
+    raw = sys.stdin.read().splitlines()
+    if not raw:
+        return 0
+    # Undoing an add gives on-modify `{}` as the new task, and 2.6.2 refuses `{}` back, which jams
+    # task undo for good. Handing back the old task lets the undo go through.
+    print(raw[0] if raw[-1].strip() == '{}' else raw[-1], flush=True)
+    try:
+        for line in score_hook(event, raw, hook_args(argv).get('command', '')):
+            print(line)
+    except Exception as error:      # fail open: the game must never stop a task command
+        if os.environ.get('TW_DEBUG'):
+            print(f'gamify: {error!r}')
+    return 0
+
+
+def score_hook(event, raw, command):
+    cfg = Config()
+    if not cfg.yes('enabled') or command in ('import', 'synchronize', 'merge') or nested_call():
+        return []
+    new = json.loads(raw[-1])
+    state = State(read_ledger(), cfg)
+    made = None
+    if event == 'add':
+        if new.get('status') == 'recurring' or any(k in new for k in ('parent', 'rtemplate', 'rindex')):
+            return []
+        if not set(new.get('tags', ())) & cfg.skip_tags():
+            made = score_add(new, state, cfg)
+    else:
+        made = score_change(json.loads(raw[0]), new, command, state, cfg)
+    return commit(made, state, cfg)
+
+
+def commit(made, state, cfg):
+    """Record an entry (with the genesis, the first time) and return the lines to show."""
+    lines, writes = [], []
+    genesis = ensure_genesis(state, cfg)
+    if genesis:
+        writes.append(genesis)
+        welcome = cfg.say('welcome')
+        lines.append(f"{ICONS['genesis']} {signed(genesis['c'])} 🪙  {welcome}".rstrip())
+    if made and made.get('id'):
+        writes.append(made)
+    append(writes, cfg)
+    after = State(state.entries + writes, cfg, state.snap)
+    if made:
+        lines += emit(made, state, after, cfg)
+    return lines if cfg.get('volume').lower() != 'off' else []
+
+
+# ── The sweep: scoring what didn't happen ─────────────────────────────────────
+
+def task_cmd(*args):
+    return ['task', 'rc.hooks=off', 'rc.gc=off', 'rc.verbose=nothing', 'rc.confirmation=off',
+            'rc.context=none', 'rc.json.array=on', *args]
+
+
+def export(*filters):
+    """Tasks for a filter, or None if task failed (never mistake a failure for an empty list)."""
+    import subprocess
+    try:
+        result = subprocess.run(task_cmd(*filters, 'export'), capture_output=True, text=True, timeout=30,
+                                stdin=subprocess.DEVNULL)
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout or '[]')
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def holiday_dates(kinds):
+    """Dates (ISO) of tw-events' holiday entries: `holidays`, `mine`, `moon` (full only), `season`."""
+    out = set()
+    for kind in kinds:
+        name = {'holidays': 'holidays.rc', 'mine': 'mine.rc', 'moon': 'sky.rc', 'season': 'sky.rc'}.get(kind)
+        if not name:
+            continue
+        items = {}
+        try:
+            text = (TASK_DIR / 'config' / name).read_text(encoding='utf-8')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith('holiday.') and '=' in line:
+                key, value = line.split('=', 1)
+                parts = key.split('.')
+                if len(parts) == 3:
+                    items.setdefault(parts[1], {})[parts[2]] = value.strip()
+        for item in items.values():
+            if kind in ('moon', 'season') and item.get('kind') != kind:
+                continue
+            if kind == 'moon' and item.get('name') != 'Full Moon':
+                continue
+            try:
+                if item.get('date'):
+                    out.add(datetime.strptime(item['date'], '%Y%m%d').date().isoformat())
+                elif item.get('start') and item.get('end'):
+                    day = datetime.strptime(item['start'], '%Y%m%d').date()
+                    last = datetime.strptime(item['end'], '%Y%m%d').date()
+                    while day <= last:
+                        out.add(day.isoformat())
+                        day += timedelta(days=1)
+            except ValueError:
+                continue
+    return out
+
+
+def write_snapshot(tasks, cfg):
+    """What the hooks can't afford to ask for on every write."""
+    urgency = {t['uuid']: t.get('urgency', 0) for t in tasks}
+    top = max(tasks, key=lambda t: t.get('urgency', 0))['uuid'] if tasks else None
+    rest = [k.strip() for k in cfg.get('rest-on').split(',') if k.strip()]
+    snap = {'t': int(time.time()), 'urgency': urgency, 'top': top,
+            'rest': sorted(holiday_dates(rest)), 'moons': sorted(holiday_dates(['moon']))}
+    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+    temp = SNAPSHOT.with_suffix('.tmp')
+    temp.write_text(json.dumps(snap), encoding='utf-8')
+    temp.replace(SNAPSHOT)
+    return snap
+
+
+def blocked_uuids(tasks):
+    pending = {t['uuid'] for t in tasks}
+    blocked = set()
+    for t in tasks:
+        depends = t.get('depends', ())
+        if isinstance(depends, str):
+            depends = depends.split(',')
+        if any(d in pending for d in depends):
+            blocked.add(t['uuid'])
+    return blocked
+
+
+def judge_day(day, tasks, blocked, state, cfg):
+    """The entries for a finished day: what was left undone, and the reward if nothing was."""
+    iso = day.isoformat()
+    end_of_day = datetime(day.year, day.month, day.day).astimezone() + timedelta(days=1)
+    genesis = date.fromisoformat(state.genesis) if state.genesis else day
+    amnesty_until = genesis + timedelta(days=cfg.int('amnesty-days'))
+    skip = cfg.skip_tags()
+    penalties, nothing_late = [], True
+    for t in tasks:
+        uuid, desc = t['uuid'], t.get('description', '')
+        entered = parse_ts(t.get('entry'))
+        if set(t.get('tags', ())) & skip or (entered and entered >= end_of_day):
+            continue
+        waiting = parse_ts(t.get('wait'))
+        if uuid in blocked or (waiting and waiting >= end_of_day):
+            continue
+        forgiven = entered and entered.date() <= genesis and day <= amnesty_until
+        due = parse_ts(t.get('due'))
+        scheduled = parse_ts(t.get('scheduled'))
+        started = parse_ts(t.get('start'))
+        if due and due < end_of_day:
+            nothing_late = False
+            if not forgiven and state.count_for('rot', uuid) < cfg.int('cap.rot-days'):
+                coins = -int(round(-cfg.num('points.rot') * urgency_factor(uuid, state.snap, cfg)))
+                penalties.append(entry('rot', coins, cfg, uuid, desc, id=f'rot:{uuid}:{iso}', day=iso))
+        elif scheduled and scheduled.date() < day:
+            nothing_late = False
+            if not forgiven:
+                penalties.append(entry('behind', cfg.int('points.behind'), cfg, uuid, desc,
+                                       id=f'behind:{uuid}:{iso}', day=iso))
+        if started and started < end_of_day and not forgiven:
+            penalties.append(entry('zombie', cfg.int('points.zombie'), cfg, uuid, desc,
+                                   id=f'zombie:{uuid}:{iso}', day=iso))
+        touched = parse_ts(t.get('modified')) or entered
+        ahead = any(x and x >= end_of_day for x in (due, scheduled, waiting))
+        if touched and not forgiven and not ahead and (end_of_day - touched).days >= cfg.int('fossil-days'):
+            year, week, _ = day.isocalendar()
+            weekly = f'fossil:{uuid}:{year}W{week}'
+            if not state.has_id(weekly):
+                penalties.append(entry('fossil', cfg.int('points.fossil'), cfg, uuid, desc, id=weekly, day=iso))
+
+    # Worst day possible: the cap keeps one bad day from being a catastrophe
+    kept, total, cap = [], 0, cfg.int('cap.penalty-day')
+    for made in sorted(penalties, key=lambda e: e['c']):
+        if made['c'] and total + made['c'] >= cap:
+            kept.append(made)
+            total += made['c']
+
+    if iso not in state.done_days and cfg.int('points.blank'):
+        kept.append(entry('blank', cfg.int('points.blank'), cfg, id=f'blank:{iso}', day=iso))
+    if nothing_late and cfg.int('points.clean'):
+        kept.append(entry('clean', cfg.int('points.clean'), cfg, id=f'clean:{iso}', day=iso))
+    return [e for e in kept if e.get('c')]
+
+
+def run_rules(state, cfg):
+    """Your own rules (gamify.rule.*), against the tasks as they stand now."""
+    import shlex
+    out = []
+    iso = today().isoformat()
+    year, week, _ = today().isocalendar()
+    skip = cfg.skip_tags()
+    for name, rule in cfg.rules().items():
+        try:
+            points = int(rule['points'])
+            filters = shlex.split(rule['filter'])
+        except ValueError:
+            continue
+        stamp = f'{year}W{week}' if rule.get('cadence') == 'weekly' else iso
+        for t in export(*filters) or ():
+            wanted = f"rule:{name}:{t.get('uuid')}:{stamp}"
+            if set(t.get('tags', ())) & skip or state.has_id(wanted):
+                continue
+            out.append(entry('rule', points, cfg, t.get('uuid', ''), t.get('description', ''),
+                             rule.get('msg', name), id=wanted))
+    return out
+
+
+def recap_text(made, state_before, state_after, cfg):
+    """The verdict shown with your next command."""
+    totals = {}
+    for e in made:
+        kind = e['k']
+        count, coins = totals.get(kind, (0, 0))
+        totals[kind] = (count + 1, coins + e['c'])
+    if not totals:
+        return ''
+    net = sum(c for _, c in totals.values())
+    parts = [f"{ICONS.get(k, '🎮')} {k}{'×' + str(n) if n > 1 else ''} {signed(c)}"
+             for k, (n, c) in sorted(totals.items(), key=lambda item: item[1][1])]
+    bad = any(c < 0 for _, c in totals.values())
+    good = any(c > 0 for _, c in totals.values())
+    event = 'recap_mixed' if bad and good else ('recap_bad' if bad else 'recap_good')
+    lines = [f"🧾 The Reckoning: {signed(net)} 🪙  " + ' · '.join(parts)]
+    quip = cfg.say(event)
+    if quip:
+        lines.append(f'   {quip}')
+    lines += fanfares(state_before, state_after, cfg)
+    return '\n'.join(lines) + '\n'
+
+
+def cmd_refresh():
+    """Judge the finished days and renew the snapshot. Run by the on-launch hook, detached."""
+    cfg = Config()
+    if not cfg.yes('enabled'):
+        return 0
+    import fcntl
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        tasks = export('status:pending')
+        if tasks is None:
+            return 1        # task failed: no judgement on data we couldn't read
+        snap = write_snapshot(tasks, cfg)
+        state = State(read_ledger(), cfg, snap)
+        genesis = ensure_genesis(state, cfg)
+        if genesis:
+            append([genesis], cfg)
+            state = State(state.entries + [genesis], cfg, snap)
+
+        now = today()
+        markers = [e['day'] for e in state.entries if e['k'] == 'sweep']
+        last = date.fromisoformat(max(markers)) if markers else date.fromisoformat(state.genesis)
+        day = max(last + timedelta(days=1), now - timedelta(days=cfg.int('backfill-days')))
+        blocked = blocked_uuids(tasks)
+        before = state
+        judged = []
+        any_day = False
+        while day < now:
+            iso = day.isoformat()
+            any_day = True
+            made = [] if state.resting_on(iso) else judge_day(day, tasks, blocked, state, cfg)
+            made = [e for e in made if not state.has_id(e['id'])]
+            marker = {'id': f'sweep:{iso}', 'k': 'sweep', 'day': iso, 'c': 0}
+            append(made + [marker], cfg)
+            judged += made
+            state = State(state.entries + made + [marker], cfg, snap)
+            day += timedelta(days=1)
+        if any_day and not state.resting_on((now - timedelta(days=1)).isoformat()):
+            made = run_rules(state, cfg)
+            append(made, cfg)
+            judged += made
+            state = State(state.entries + made, cfg, snap)
+        if judged and cfg.get('volume').lower() != 'off':
+            text = recap_text(judged, before, state, cfg)
+            if text:
+                with RECAP.open('a', encoding='utf-8') as handle:
+                    handle.write(text)
+    return 0
+
+
+# ── The board ─────────────────────────────────────────────────────────────────
+
+BOXES = {
+    'double': '╔═╗║╚╝╟─╢',
+    'single': '┌─┐│└┘├─┤',
+    'ascii': '+-+|+++-+',
+}
+
+
+def width(text):
+    """Terminal cells a string takes (wide emoji are two, variation selectors none)."""
+    import unicodedata
+    cells = 0
+    for ch in text:
+        if unicodedata.combining(ch) or ch in ('️', '‍'):
+            continue
+        cells += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+    return cells
+
+
+def bar(value, low, high, cells=20):
+    if high is None or high <= low:
+        return '▓' * cells
+    filled = max(0, min(cells, int((value - low) / (high - low) * cells)))
+    return '▓' * filled + '░' * (cells - filled)
+
+
+def tally(entries, day):
+    groups = {'done': 0, 'tidy': 0, 'rot': 0, 'waltz': 0, 'net': 0}
+    for e in entries:
+        if e.get('day') != day:
+            continue
+        coins = e.get('c', 0)
+        groups['net'] += coins
+        kind = e['k']
+        if kind in ('done', 'log'):
+            groups['done'] += coins
+        elif kind in ('add', 'file', 'genesis') or (kind == 'delete' and coins > 0):
+            groups['tidy'] += coins
+        elif kind == 'push' or kind == 'delete':
+            groups['waltz'] += coins
+        elif kind in SWEEP_KINDS:
+            groups['rot' if coins < 0 else 'tidy'] += coins
+    return groups
+
+
+def live_counts(cfg, state):
+    """Rotting, fossils and zombies right now, or None if task can't say."""
+    tasks = export('status:pending')
+    if tasks is None:
+        return None
+    now = datetime.now().astimezone()
+    skip = cfg.skip_tags()
+    rotting = fossils = zombies = 0
+    for t in tasks:
+        if set(t.get('tags', ())) & skip:
+            continue
+        due, started = parse_ts(t.get('due')), parse_ts(t.get('start'))
+        touched = parse_ts(t.get('modified')) or parse_ts(t.get('entry'))
+        ahead = any(x and x > now for x in map(parse_ts, (t.get('due'), t.get('scheduled'), t.get('wait'))))
+        rotting += bool(due and due < now)
+        zombies += bool(started and started.date() < now.date())
+        fossils += bool(touched and not ahead and (now - touched).days >= cfg.int('fossil-days'))
+    return rotting, fossils, zombies
+
+
+def summary(cfg):
+    state = State(read_ledger(), cfg)
+    level, title, low, high = state.rank()
+    now = today().isoformat()
+    yesterday = (today() - timedelta(days=1)).isoformat()
+    prizes = cfg.prizes()
+    return {
+        'state': state, 'level': level, 'rank': title, 'low': low, 'next': high, 'xp': state.xp,
+        'coins': state.coins, 'streak': state.streak, 'best': state.best,
+        'today': tally(state.live, now), 'yesterday': tally(state.live, yesterday),
+        'paused': state.paused_on(now),
+        'affordable': sorted((k for k, (cost, _) in prizes.items() if cost <= state.coins and state.coins >= 0),
+                             key=lambda k: prizes[k][0]),
+        'prizes': prizes,
+    }
+
+
+def cmd_status():
+    cfg = Config()
+    info = summary(cfg)
+    state = info['state']
+    if not state.entries:
+        print('🎮 No game yet: it starts with your first task action.')
+        return 0
+    box = BOXES.get(cfg.get('box'), BOXES['double'])
+    inner = 58
+    color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+    gold, red, dim, off = ('\033[33;1m', '\033[31m', '\033[2m', '\033[0m') if color else ('', '', '', '')
+
+    def row(text=''):
+        pad = max(0, inner - width(text) - 2)
+        print(f'{box[3]} {text}{" " * pad} {box[3]}')
+
+    def rule():
+        print(box[6] + box[7] * inner + box[8])
+
+    heading = ' 🎮 TASKWARRIOR: THE GAME '
+    side = (inner - width(heading)) // 2
+    print(box[0] + box[1] * side + heading + box[1] * (inner - width(heading) - side) + box[2])
+    row(f"⭐ Level {info['level']}")
+    row(f"   {info['rank']}")
+    target = info['next'] if info['next'] is not None else info['xp']
+    row(f"XP {bar(info['xp'], info['low'], info['next'])} {info['xp']}/{target}")
+    row(f"🪙 Coins: {signed(info['coins']) if info['coins'] < 0 else info['coins']}"
+        f"{'  (in debt: the shop is shut)' if info['coins'] < 0 else ''}")
+    row(f"🔥 Streak: {info['streak']} days   🏅 Best: {info['best']}"
+        f"{'   🏖️ paused' if info['paused'] else ''}")
+    rule()
+
+    def tally_row(label, t):
+        return (f"{label} ✅ {signed(t['done'])}  🧹 {signed(t['tidy'])}  🍂 {signed(t['rot'])}  "
+                f"💃 {signed(t['waltz'])}  NET {signed(t['net'])}")
+
+    row(tally_row('TODAY    ', info['today']))
+    row(tally_row('YESTERDAY', info['yesterday']))
+    counts = live_counts(cfg, state)
+    if counts:
+        row(f'🍂 Rotting: {counts[0]}   🦕 Fossils: {counts[1]}   🧟 Zombies: {counts[2]}')
+    rule()
+    if info['affordable']:
+        labels = [info['prizes'][k][1] for k in info['affordable'][:2]]
+        more = len(info['affordable']) - len(labels)
+        row('🛒 ' + ' · '.join(labels)[:inner - 8] + (f' +{more}' if more > 0 else ''))
+    elif info['prizes']:
+        cheapest = min(cost for cost, _ in info['prizes'].values())
+        row(f"🛒 Next prize at {cheapest} coins: {cheapest - info['coins']} to go")
+    print(box[4] + box[1] * inner + box[5])
+    latest = [e for e in state.live if e.get('c')]
+    if latest and latest[-1].get('d'):
+        e = latest[-1]
+        tone = gold if e['c'] > 0 else red
+        print(f"{dim}last:{off} {tone}{signed(e['c'])}{off} {e['d'][:50]}")
+    return 0
+
+
+def cmd_line():
+    cfg = Config()
+    info = summary(cfg)
+    if not info['state'].entries:
+        return 0
+    print(f"🎮 L{info['level']} ⭐{info['xp']} 🪙{info['coins']} 🔥{info['streak']}")
+    return 0
+
+
+def cmd_json():
+    cfg = Config()
+    info = summary(cfg)
+    out = {k: v for k, v in info.items() if k not in ('state', 'prizes', 'low')}
+    out['prizes'] = {k: {'cost': c, 'label': label} for k, (c, label) in info['prizes'].items()}
+    counts = live_counts(cfg, info['state'])
+    if counts:
+        out.update(zip(('rotting', 'fossils', 'zombies'), counts))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_log(argv):
+    cfg = Config()
+    try:
+        count = int(argv[0]) if argv else 20
+    except ValueError:
+        sys.stderr.write('gamify log: N must be a number\n')
+        return 2
+    state = State(read_ledger(), cfg)
+    shown = [e for e in state.entries if e.get('c')][-count:]
+    if not shown:
+        print('🎮 The ledger is empty.')
+        return 0
+    for e in shown:
+        when = datetime.fromtimestamp(e.get('t', 0)).strftime('%m-%d %H:%M')
+        kind = e['k']
+        icon = ICONS.get(e.get('say', ''), ICONS.get(kind, '🎮'))
+        undone = ' (undone)' if e['id'] in state.reversed else ''
+        detail = e.get('why', '')
+        print(f"{when}  {signed(e['c']):>5}  {icon} {kind:<8} {e.get('d', '')[:44]}"
+              f"{'  [' + detail + ']' if detail else ''}{undone}")
+    return 0
+
+
+def cmd_shop():
+    cfg = Config()
+    state = State(read_ledger(), cfg)
+    prizes = cfg.prizes()
+    print(f'🛒 The shop. You have {state.coins} 🪙' + ('; it is shut until you are out of debt.' if state.coins < 0 else ''))
+    for key, (cost, label) in sorted(prizes.items(), key=lambda item: item[1][0]):
+        mark = '✅' if 0 <= cost <= state.coins else '  '
+        print(f'  {mark} {cost:>5}  {key:<12} {label}')
+    print('Buy one: gamify redeem <key>')
+    return 0
+
+
+def cmd_redeem(argv):
+    cfg = Config()
+    prizes = cfg.prizes()
+    if not argv or argv[0] not in prizes:
+        sys.stderr.write(f"gamify redeem: which prize? {', '.join(sorted(prizes))}\n")
+        return 2
+    key = argv[0]
+    cost, label = prizes[key]
+    state = State(read_ledger(), cfg)
+    if state.coins < cost:
+        print(f"🚫 {label} costs {cost} 🪙. {cfg.say('broke', need=cost - state.coins)}".rstrip())
+        return 1
+    append([entry('prize', -cost, cfg, desc=label, why=key)], cfg)
+    print(f"{ICONS['prize']} {label}: {state.coins - cost} 🪙 left. {cfg.say('prize')}".rstrip())
+    return 0
+
+
+def cmd_pause(argv):
+    cfg = Config()
+    try:
+        days = int(argv[0]) if argv else 7
+    except ValueError:
+        sys.stderr.write('gamify pause: DAYS must be a number\n')
+        return 2
+    start = today()
+    until = start + timedelta(days=days - 1)
+    append([{'id': new_id('pause'), 'k': 'pause', 'c': 0, 'from': start.isoformat(), 'to': until.isoformat()}], cfg)
+    print(f"{ICONS['pause']} No penalties until {until.isoformat()} inclusive. Earnings still count.")
+    return 0
+
+
+def cmd_resume():
+    cfg = Config()
+    append([{'id': new_id('resume'), 'k': 'resume', 'c': 0}], cfg)
+    print(f"{ICONS['resume']} The game is back on.")
+    return 0
+
+
+def cmd_edit():
+    import shlex
+    import subprocess
+    editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
+    return subprocess.call(shlex.split(editor) + [str(RC_FILE)])
+
+
+def main(argv):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except AttributeError:
+            pass
+    if len(argv) >= 2 and argv[0] == '--hook':
+        return run_hook(argv[1], argv[2:])
+    head = argv[0] if argv else ''
+    rest = argv[1:]
+    if not argv or head in ('status', 'score'):
+        return cmd_status()
+    if head in ('-h', '--help', 'help'):
+        print(__doc__.strip().split('\n\nVersion')[0])
+        return 0
+    if head in ('-v', '--version'):
+        print(f'gamify {VERSION}')
+        return 0
+    commands = {
+        '--refresh': lambda: cmd_refresh(), '--line': cmd_line, '--json': cmd_json, 'shop': cmd_shop,
+        'resume': cmd_resume, '-e': cmd_edit, '--edit': cmd_edit,
+        'log': lambda: cmd_log(rest), 'redeem': lambda: cmd_redeem(rest), 'pause': lambda: cmd_pause(rest),
+    }
+    if head not in commands:
+        sys.stderr.write(f'gamify: unknown command: {head} (try gamify -h)\n')
+        return 2
+    return commands[head]()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

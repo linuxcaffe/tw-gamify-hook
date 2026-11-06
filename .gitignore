@@ -1,0 +1,6 @@
+*.orig
+logs/
+dev/
+claude/
+__pycache__/
+.pytest_cache/

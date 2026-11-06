@@ -1,0 +1,93 @@
+# gamify.rc - Taskwarrior: The Game. If you can't make it perfect, make it adjustable.
+#
+# Every value here is the default, so delete any line you don't care about. A station's own
+# setting can go in ~/.task/local.rc and wins. `#` starts a comment, values included.
+
+# ── The game ──────────────────────────────────────────────────────────────────
+gamify.enabled          = yes           # no = paused: nothing scored or judged, the ledger is kept
+gamify.voice            = grandmother   # grandmother | coach | sergeant | commentator
+gamify.volume           = normal        # off | quiet (fanfares only) | normal (one line) | loud (+ totals)
+gamify.zero-quip-chance = 0.2           # how often a no-points action gets a remark anyway (0 to 1)
+gamify.box              = double        # the board's border: double | single | ascii
+
+# ── Doing things ──────────────────────────────────────────────────────────────
+# A finished task pays: points.done x urgency factor x punctuality factor, then the bonuses.
+gamify.points.done        = 10
+gamify.factor.early       = 1.5         # finished before the due day
+gamify.factor.ontime      = 1.25        # finished on the due day
+gamify.factor.late-decay  = 0.1         # lost per day late...
+gamify.factor.late-floor  = 0.25        # ...down to this, so late always beats never
+gamify.very-late-days     = 7           # from here it's "very late" (for the remarks)
+gamify.use-scheduled      = yes         # no due date? judge punctuality by scheduled
+gamify.urgency-scale      = 20          # factor = 1 + urgency / this...
+gamify.urgency-max        = 3           # ...up to this
+gamify.points.focus       = 3           # started and finished within a day
+gamify.points.regicide    = 15          # finished your most urgent task
+gamify.regicide-min-urgency = 5         # no crown for toppling a very small king
+gamify.quick-minutes      = 5           # added and finished this fast? flat points.quick instead
+gamify.points.quick       = 2
+gamify.points.log         = 2           # task log: flat, no punctuality
+gamify.cap.log            = 10          # paid per day
+
+# ── Housekeeping ──────────────────────────────────────────────────────────────
+gamify.points.add-filed   = 1           # added with a project and a due or scheduled date
+gamify.cap.add            = 10          # paid per day
+gamify.points.file        = 1           # gave a task its missing project, due or priority
+gamify.cap.file           = 5           # paid per day
+gamify.points.delete-stale = 2          # deleted a task at least stale-days old
+gamify.stale-days         = 60
+gamify.points.delete-overdue = -5       # deleted an overdue task (recurring ones excepted)
+
+# ── Dodging ───────────────────────────────────────────────────────────────────
+gamify.points.push        = -1          # due date pushed later: doubles each time, per task
+gamify.points.push-max    = -8          # ...down to this
+
+# ── Not doing things (judged once a day, for the days that have finished) ─────
+gamify.points.rot         = -2          # overdue, per task per day, x urgency factor
+gamify.cap.rot-days       = 30          # a task stops rotting after this many charges
+gamify.points.behind      = -1          # past scheduled date, not overdue, per task per day
+gamify.points.zombie      = -2          # started and still active, per task per day
+gamify.points.fossil      = -1          # untouched for fossil-days, per task per week
+gamify.fossil-days        = 90
+gamify.points.blank       = -5          # finished nothing all day
+gamify.points.clean       = 5           # nothing overdue or behind all day
+gamify.cap.penalty-day    = -25         # the most one day's task penalties can cost
+gamify.backfill-days      = 14          # judge at most this many missed days
+
+# ── Mercy ─────────────────────────────────────────────────────────────────────
+gamify.points.welcome     = 25          # the first entry in the ledger
+gamify.amnesty-days       = 14          # tasks you had on day one: no penalties for this long
+gamify.rest-on            = holidays    # no penalties on: holidays, mine, moon, season (tw-events)
+gamify.moon-bonus         = yes         # late tasks pay double at a full moon: werewolf hours
+gamify.factor.moon        = 2
+gamify.skip-tags          = noscore     # tasks with these tags (comma-separated) don't play
+
+# ── Currency ──────────────────────────────────────────────────────────────────
+gamify.xp-rate            = 1           # XP per coin earned. Only coins are ever lost.
+gamify.streak-counts-log  = yes         # does task log keep a streak alive?
+
+# ── Prizes (gamify shop, gamify redeem <key>) ─────────────────────────────────
+gamify.prize.youtube.cost  = 100
+gamify.prize.youtube.label = 📺 One hour of YouTube, guilt-free
+gamify.prize.donut.cost    = 150
+gamify.prize.donut.label   = 🍩 One (1) sweet treat
+gamify.prize.nap.cost      = 250
+gamify.prize.nap.label     = 😴 A nap, on purpose
+
+# ── Ranks: gamify.rank.<xp> = title. Any at all replace the built-in twelve. ──
+#gamify.rank.0    = Intern of Intentions
+#gamify.rank.500  = Keeper of the Sticky Note
+
+# ── More remarks: gamify.say.<voice>.<event>.<anything> = line. Adds to the built-ins.
+# Events: early ontime done late verylate quick regicide add bare log file mercy evidence delete
+#         push rev prize broke level streak recap_bad recap_mixed recap_good welcome
+# {d} is the task, {rank} the title, {n} the streak, {need} the coins short.
+#gamify.say.grandmother.push.1 = Again? I've outlived three of your deadlines.
+
+# ── Your own rules, judged once a day on the tasks as they stand ──────────────
+# .filter any task filter, .points how much per task, .msg shown in gamify log,
+# .cadence daily (default) or weekly.
+#gamify.rule.no-project.filter  = +PENDING project:
+#gamify.rule.no-project.points  = -1
+#gamify.rule.no-project.msg     = no project
+#gamify.rule.no-project.cadence = weekly
