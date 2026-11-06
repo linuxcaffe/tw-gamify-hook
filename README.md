@@ -21,7 +21,7 @@ $ task next
 - A finished task pays `points × urgency × punctuality`; late always beats never, and deleting never beats doing
 - XP sets your rank and never drops; coins buy prizes and can go into debt
 - Everything is adjustable in `~/.task/config/gamify.rc`
-- Works on every client: its remarks are hook feedback, which tw-web already shows
+- Works on every client: tw-web shows its remarks, and vit offers to open the scoreboard on level-ups, streak milestones and the daily verdict
 - Follows you between stations: gittw merges the ledger
 - Requires Taskwarrior 2.6.x and Python 3.7+
 
@@ -38,6 +38,7 @@ The game starts with your next task action. Tasks you already have get an amnest
 
 | Command | |
 |---|---|
+| `tw score`, `gamify score` | The full scoreboard: trophies, Most Wanted, the last word |
 | `gamify` | The status board |
 | `gamify log [N]` | The ledger: what you got and why |
 | `gamify shop` / `gamify redeem <key>` | The prizes, and buying one |
@@ -103,6 +104,10 @@ gamify.rule.no-project.cadence = weekly
 
 `gamify.enabled = no` pauses everything and keeps the ledger. A setting in `~/.task/local.rc` applies to that station and wins.
 
+## In vit
+
+vit hides what hooks print when a command succeeds, so you won't see routine remarks there; your points still count. For the big moments (a level-up, a streak milestone, the daily verdict) gamify uses the spool, and vit asks whether to open the scoreboard. `gamify.spool-clients` sets which clients get this. The scoreboard always shows the last thing that was said.
+
 ## How it works
 
 - `on-add_zz-gamify.sh`, `on-modify_zz-gamify.sh`: score the change. The `zz` makes them run last, so a hook that rejects a command does so before any points are paid.
@@ -116,7 +121,7 @@ gamify.rule.no-project.cadence = weekly
 
 - A finished day is judged against your tasks as they stand now, so finishing a task before the sweep runs spares it that day's rot.
 - A task added since the last snapshot (up to 30 minutes) has an urgency factor of 1.
-- `tw-web` shows remarks in its warning style.
+- tw-web shows remarks in its warning style.
 
 ## `task undo` of an add
 

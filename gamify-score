@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# gamify-score - the scoreboard, for the `tw score` keyword (a keyword names one executable).
+exec "${TW_TASK_DIR:-$HOME/.task}/scripts/gamify" score "$@"

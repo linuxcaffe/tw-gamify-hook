@@ -650,4 +650,144 @@ def test_installer_keeps_your_settings_and_score_and_leaves_no_trace_of_itself(t
     assert (task_dir / 'config' / 'gamify.rc.new').exists()
     assert (task_dir / '.gitattributes').read_text().count('merge=union') == 1
     manifest = (task_dir / 'config' / '.tw_manifest').read_text().splitlines()
-    assert len([l for l in manifest if l.startswith('gamify|')]) == 5
+    assert len([l for l in manifest if l.startswith('gamify|')]) == 6
+    assert os.access(task_dir / 'scripts' / 'gamify-score', os.X_OK)
+    wrappers = (task_dir / 'config' / '.tw_wrappers').read_text()
+    assert wrappers.count('score|gamify-score|') == 1
+    assert run('remove').returncode == 0
+    assert 'score|' not in (task_dir / 'config' / '.tw_wrappers').read_text()
+
+
+# ── The scoreboard ────────────────────────────────────────────────────────────
+
+def load_scope():
+    scope = {'__name__': 'gamify_test', '__file__': str(REPO / 'gamify')}
+    exec(compile((REPO / 'gamify').read_text(encoding='utf-8'), 'gamify', 'exec'), scope)
+    return scope
+
+
+def board_lines(text):
+    return [l for l in text.splitlines() if l[:1] in '╔║╟╚']
+
+
+def test_scoreboard_lines_up_even_with_long_names_and_debt(tmp_path):
+    game = Game(tmp_path, 'gamify.rank.0 = ' + 'Very Long Title Indeed ' * 5 + '\ngamify.rank.99999 = ' + 'Next ' * 30 + '\n')
+    game.write_ledger([{'id': 'genesis', 'k': 'genesis', 'c': -40, 'x': 0, 't': 1, 'day': date.today().isoformat()}])
+    game.import_task(description='a description that goes on and on ' * 6, due=stamp(-9), entry=stamp(-30), modified=stamp(-30))
+    result = game.gamify('score')
+    assert result.returncode == 0, result.stderr
+    scope = load_scope()
+    lines = board_lines(result.stdout)
+    assert len(lines) > 8 and len({scope['width'](l) for l in lines}) == 1, lines
+    assert 'Shut until' in result.stdout
+
+
+def test_scoreboard_names_the_offenders_and_what_they_cost(game):
+    rotter = game.import_task(description='renew the thing', due=stamp(-9), entry=stamp(-30), modified=stamp(-30))
+    game.import_task(description='fix the gate latch', entry=stamp(-400), modified=stamp(-400))
+    game.import_task(description='innocent', due=stamp(5), entry=stamp(-400), modified=stamp(-400))
+    today = date.today().isoformat()
+    game.write_ledger([{'id': 'genesis', 'k': 'genesis', 'c': 25, 'x': 25, 't': 1, 'day': today},
+                       {'id': 'r1', 'k': 'rot', 'c': -6, 'x': 0, 't': 2, 'day': today, 'u': rotter['uuid']}])
+    out = game.gamify('score').stdout
+    assert 'renew the thing' in out and '9 days late, −6 so far' in out
+    assert 'fix the gate latch' in out and '400 days untouched' in out
+    assert 'innocent' not in out
+
+
+def test_nobody_wanted(game):
+    game.task('add', 'fresh')
+    assert 'Nobody' in game.gamify('score').stdout
+
+
+def test_trophies_are_won_counted_and_adjustable(tmp_path):
+    game = Game(tmp_path, 'gamify.trophy.moon.need = 0\ngamify.trophy.clean.label = 🧼 Spotless\n')
+    today = date.today().isoformat()
+    rows = [{'id': 'genesis', 'k': 'genesis', 'c': 0, 'x': 0, 't': 1, 'day': today}]
+    for n in range(3):
+        rows.append({'id': f'd{n}', 'k': 'done', 'c': 9, 'x': 9, 't': 2, 'day': today, 'u': str(n), 'why': 'done+moon+regicide'})
+    rows.append({'id': 'c1', 'k': 'clean', 'c': 5, 'x': 5, 't': 3, 'day': today})
+    rows.append({'id': 'd9', 'k': 'done', 'c': 9, 'x': 9, 't': 4, 'day': today, 'u': 'x', 'why': 'done+regicide'})
+    rows.append({'id': 'rev:d9', 'k': 'rev', 'rev': 'd9', 'c': -9, 'x': -9, 't': 5, 'day': today})
+    game.write_ledger(rows)
+    out = game.gamify('score').stdout
+    assert '👑 Regicide ×3' in out           # the undone one doesn't count
+    assert 'Werewolf' not in out             # retired
+    assert '🧼 Spotless' in out and '🔒 Next:' in out
+
+
+def test_debtors_prison_remembers_your_lowest_point(game):
+    today = date.today().isoformat()
+    game.write_ledger([{'id': 'genesis', 'k': 'genesis', 'c': 0, 'x': 0, 't': 1, 'day': today},
+                       {'id': 'a', 'k': 'blank', 'c': -60, 'x': 0, 't': 2, 'day': '2020-01-01'},
+                       {'id': 'b', 'k': 'done', 'c': 100, 'x': 100, 't': 3, 'day': today}])
+    assert "Debtor's Prison" in game.gamify('score').stdout
+
+
+def test_last_word_survives_for_the_scoreboard(game):
+    game.task('add', 'filed', 'project:x', 'due:tomorrow')
+    said = (game.dir / 'logs' / 'gamify-lastword.txt').read_text(encoding='utf-8').strip()
+    assert said and said in game.gamify('score').stdout
+
+
+def test_score_works_in_ascii_and_with_no_game(tmp_path):
+    game = Game(tmp_path, 'gamify.box = ascii\n')
+    assert 'No game yet' in game.gamify('score').stdout
+    game.task('add', 'first')
+    out = game.gamify('score').stdout
+    assert 'THE SCORE' in out and '▓' not in out and '▁' not in out
+
+
+def test_gamify_score_script_runs_the_scoreboard(game):
+    shutil.copy(REPO / 'gamify-score', game.dir / 'scripts' / 'gamify-score')
+    game.task('add', 'first')
+    result = subprocess.run([str(game.dir / 'scripts' / 'gamify-score')], env=game.env, capture_output=True, text=True)
+    assert 'TROPHY CASE' in result.stdout
+
+
+# ── Clients that hide hook output ─────────────────────────────────────────────
+
+def client_env(game, client='vit'):
+    spool = game.root / 'spool'
+    spool.mkdir(exist_ok=True)
+    game.env.update(TW_SPOOL_DIR=str(spool), TW_CLIENT=client, TW_NOINTERACT='1')
+    return spool
+
+
+def test_level_up_is_spooled_for_vit_as_plain_text(tmp_path):
+    game = Game(tmp_path, 'gamify.rank.0 = Peasant\ngamify.rank.20 = Duke\n')
+    game.write_ledger([{'id': 'genesis', 'k': 'genesis', 'c': 19, 'x': 19, 't': 1, 'day': date.today().isoformat()}])
+    spool = client_env(game)
+    game.task('add', 'filed', 'project:x', 'due:tomorrow')
+    commands = list(spool.glob('*.cmd'))
+    assert len(commands) == 1
+    assert commands[0].read_text().strip().endswith('gamify score')
+    reason = commands[0].with_suffix('.reason').read_text()
+    assert reason.startswith('gamify: LEVEL 2: Duke') and reason.isascii()
+
+
+def test_routine_scoring_never_interrupts_vit(game):
+    spool = client_env(game)
+    game.task('add', 'filed', 'project:x', 'due:tomorrow')
+    assert list(spool.glob('*')) == []
+
+
+def test_other_clients_are_not_spooled(tmp_path):
+    game = Game(tmp_path, 'gamify.rank.0 = Peasant\ngamify.rank.20 = Duke\n')
+    game.write_ledger([{'id': 'genesis', 'k': 'genesis', 'c': 19, 'x': 19, 't': 1, 'day': date.today().isoformat()}])
+    spool = client_env(game, 'tw-web')
+    result = game.task('add', 'filed', 'project:x', 'due:tomorrow')
+    assert list(spool.glob('*')) == [] and 'LEVEL 2' in result.stderr
+
+
+def test_the_verdict_reaches_vit_once_by_the_spool(game):
+    game.backdate(30, last_sweep=2)
+    aged(game, f'due={stamp(-10)}')
+    game.gamify('--refresh')
+    spool = client_env(game)
+    first = game.task('count')
+    game.task('count')
+    assert 'Reckoning' not in first.stderr
+    reasons = list(spool.glob('*.reason'))
+    assert len(reasons) == 1 and 'The Reckoning' in reasons[0].read_text() and reasons[0].read_text().isascii()
+    assert not (game.dir / 'logs' / 'gamify-recap.txt').exists()

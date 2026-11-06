@@ -3,6 +3,7 @@
 gamify - Taskwarrior: The Game. Points, ranks, prizes and a disappointed grandmother.
 
   gamify               the status board
+  gamify score         the full scoreboard: trophies, Most Wanted, the works (tw score)
   gamify log [N]       the last N ledger entries (default 20): what you got, and why
   gamify shop          the prizes, and what you can afford
   gamify redeem <key>  buy a prize (honour system; the purchase is on the record)
@@ -15,7 +16,7 @@ gamify - Taskwarrior: The Game. Points, ranks, prizes and a disappointed grandmo
                        (run detached by the on-launch hook)
   gamify -v            version
 
-Version: 0.1.0
+Version: 0.2.0
 """
 import json
 import os
@@ -25,13 +26,14 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 TASK_DIR = Path(os.environ.get('TW_TASK_DIR', str(Path.home() / '.task')))
 RC_FILE = TASK_DIR / 'config' / 'gamify.rc'
 LOCAL_RC = TASK_DIR / 'local.rc'
 LEDGER = TASK_DIR / 'config' / 'gamify-ledger.jsonl'
 SNAPSHOT = TASK_DIR / 'logs' / 'gamify-snapshot.json'
 RECAP = TASK_DIR / 'logs' / 'gamify-recap.txt'
+LAST_WORD = TASK_DIR / 'logs' / 'gamify-lastword.txt'
 LOCK = TASK_DIR / 'logs' / 'gamify.lock'
 
 # Every key the code reads, with its default. gamify.rc documents them all (a test keeps that true).
@@ -41,6 +43,8 @@ DEFAULTS = {
     'volume': 'normal',            # off | quiet | normal | loud
     'zero-quip-chance': '0.2',
     'box': 'double',               # double | single | ascii
+    'spool-clients': 'vit',        # clients that hide hook output: fanfares reach them by the spool
+    'most-wanted': '3',
     'points.done': '10',
     'points.quick': '2',
     'points.log': '2',
@@ -114,6 +118,26 @@ ICONS = {
     'rot': '🍂', 'behind': '🐢', 'zombie': '🧟', 'fossil': '🦕', 'blank': '💤', 'clean': '🏆',
     'rule': '📜', 'pause': '🏖️', 'resume': '🔔', 'moon': '🌕', 'level': '🎉', 'streak': '🔥',
 }
+
+# (key, label, what it counts, how many it takes, shown with a count). gamify.trophy.<key>.need
+# and .label adjust one; a need of 0 retires it.
+TROPHIES = [
+    ('regicide', '👑 Regicide', 'regicide', 1, True),
+    ('moon', '🌕 Werewolf', 'moon', 1, True),
+    ('clean', '🏆 Clean Sheet', 'clean', 1, True),
+    ('early', '⚡ Ahead of Time', 'early', 10, False),
+    ('focus', '🧘 Deep Focus', 'focus', 10, False),
+    ('century', '💯 Hundred Club', 'done', 100, False),
+    ('week', '🔥 Week Without Shame', 'streak', 7, False),
+    ('month', '📅 Month of Sundays', 'streak', 30, False),
+    ('archaeologist', '🦴 Archaeologist', 'verylate', 1, True),
+    ('undertaker', '🪦 Undertaker', 'mercy', 10, False),
+    ('spender', '🛒 Big Spender', 'prize', 5, False),
+    ('waltz', '💃 Strictly Come Procrastinating', 'pushes', 4, False),
+    ('debtor', "💸 Debtor's Prison", 'debt', 50, False),
+]
+
+VOICE_ICONS = {'grandmother': '👵', 'coach': '📣', 'sergeant': '🪖', 'commentator': '🎤'}
 
 SWEEP_KINDS = {'rot', 'behind', 'zombie', 'fossil', 'blank', 'clean', 'rule'}
 STREAK_MILESTONES = (3, 7, 14, 30, 60, 100, 200, 365)
@@ -255,6 +279,7 @@ def read_rc(path):
 
 class Config:
     def __init__(self):
+        self.spoken = ''
         self.raw = read_rc(RC_FILE)
         self.raw.update(read_rc(LOCAL_RC))     # a station's own setting wins
 
@@ -327,6 +352,7 @@ class Config:
         line = random.choice(lines)
         for key, value in values.items():
             line = line.replace('{' + key + '}', str(value))
+        self.spoken = line
         return line
 
 
@@ -691,7 +717,41 @@ def emit(made, before, after, cfg):
             lines.append(line)
     if volume == 'loud' and made.get('c'):
         lines.append(f"   ⭐ {after.xp} XP · 🪙 {after.coins} · 🔥 {after.streak}")
-    return lines + fanfares(before, after, cfg)
+    return lines
+
+
+def plain_line(text):
+    """One line of ASCII: what a client's curses prompt can be trusted with."""
+    text = text.replace('−', '-').encode('ascii', 'ignore').decode()
+    return ' '.join(text.split())
+
+
+def spool_board(reason, cfg):
+    """Offer the scoreboard through a client's spool (CONVENTIONS §3), for a client that hides
+    what hooks print. The client asks first, with the reason. True if it was left there."""
+    spool_dir = os.environ.get('TW_SPOOL_DIR')
+    clients = {c.strip() for c in cfg.get('spool-clients').split(',')}
+    if not spool_dir or os.environ.get('TW_CLIENT', '') not in clients:
+        return False
+    import shlex
+    stem = Path(spool_dir) / f'gamify-{time.time_ns():x}'
+    try:
+        stem.with_suffix('.reason').write_text(f'gamify: {plain_line(reason)}\n', encoding='utf-8')
+        stem.with_suffix('.cmd').write_text(f"{shlex.quote(str(TASK_DIR / 'scripts' / 'gamify'))} score\n",
+                                            encoding='utf-8')
+    except OSError:
+        return False
+    return True
+
+
+def remember_last_word(cfg):
+    """Keep what was last said for the scoreboard: some clients never show it."""
+    if cfg.spoken:
+        try:
+            LAST_WORD.parent.mkdir(parents=True, exist_ok=True)
+            LAST_WORD.write_text(cfg.spoken + '\n', encoding='utf-8')
+        except OSError:
+            pass
 
 
 def ensure_genesis(state, cfg):
@@ -776,7 +836,13 @@ def commit(made, state, cfg):
     after = State(state.entries + writes, cfg, state.snap)
     if made:
         lines += emit(made, state, after, cfg)
-    return lines if cfg.get('volume').lower() != 'off' else []
+    if cfg.get('volume').lower() == 'off':
+        return []
+    fanfare = fanfares(state, after, cfg)
+    if fanfare:
+        spool_board(fanfare[0], cfg)
+    remember_last_word(cfg)
+    return lines + fanfare
 
 
 # ── The sweep: scoring what didn't happen ─────────────────────────────────────
@@ -1010,9 +1076,28 @@ def cmd_refresh():
             state = State(state.entries + made, cfg, snap)
         if judged and cfg.get('volume').lower() != 'off':
             text = recap_text(judged, before, state, cfg)
+            remember_last_word(cfg)
             if text:
                 with RECAP.open('a', encoding='utf-8') as handle:
                     handle.write(text)
+    return 0
+
+
+def cmd_recap():
+    """Deliver the verdict, once: by the on-launch hook's output, or by the spool for a client
+    that would throw that output away."""
+    cfg = Config()
+    try:
+        text = RECAP.read_text(encoding='utf-8')
+        RECAP.unlink()
+    except OSError:
+        return 0
+    lines = text.splitlines()
+    if lines:
+        headline = lines[0].split('🪙')[0]
+        said = lines[1] if len(lines) > 1 else ''
+        if not spool_board(f'{headline}coins. {said}', cfg):
+            sys.stdout.write(text)
     return 0
 
 
@@ -1027,13 +1112,26 @@ BOXES = {
 
 def width(text):
     """Terminal cells a string takes (wide emoji are two, variation selectors none)."""
+    import re
     import unicodedata
     cells = 0
-    for ch in text:
+    for ch in re.sub(r'\x1b\[[0-9;]*m', '', text):
         if unicodedata.combining(ch) or ch in ('️', '‍'):
             continue
         cells += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
     return cells
+
+
+def fit(text, cells):
+    """Text cut to fit in that many terminal cells."""
+    if width(text) <= cells:
+        return text
+    out = ''
+    for ch in text:
+        if width(out + ch) > cells - 1:
+            break
+        out += ch
+    return out + '…'
 
 
 def bar(value, low, high, cells=20):
@@ -1112,6 +1210,7 @@ def cmd_status():
     gold, red, dim, off = ('\033[33;1m', '\033[31m', '\033[2m', '\033[0m') if color else ('', '', '', '')
 
     def row(text=''):
+        text = fit(text, inner - 2)
         pad = max(0, inner - width(text) - 2)
         print(f'{box[3]} {text}{" " * pad} {box[3]}')
 
@@ -1127,7 +1226,8 @@ def cmd_status():
     row(f"XP {bar(info['xp'], info['low'], info['next'])} {info['xp']}/{target}")
     row(f"🪙 Coins: {signed(info['coins']) if info['coins'] < 0 else info['coins']}"
         f"{'  (in debt: the shop is shut)' if info['coins'] < 0 else ''}")
-    row(f"🔥 Streak: {info['streak']} days   🏅 Best: {info['best']}"
+    run = f"{info['streak']} day{'' if info['streak'] == 1 else 's'}"
+    row(f"🔥 Streak: {run}   🏅 Best: {info['best']}"
         f"{'   🏖️ paused' if info['paused'] else ''}")
     rule()
 
@@ -1154,6 +1254,219 @@ def cmd_status():
         e = latest[-1]
         tone = gold if e['c'] > 0 else red
         print(f"{dim}last:{off} {tone}{signed(e['c'])}{off} {e['d'][:50]}")
+    return 0
+
+
+BANNER = (' ▀█▀ █ █ █▀▀   █▀▀ █▀█ █▀▄▀█ █▀▀',
+          '  █  █▀█ ██▄   █▄█ █▀█ █ ▀ █ ██▄')
+
+
+def spark(values):
+    """(glyph, value) for each day: taller is better."""
+    ticks = '▁▂▃▄▅▆▇█'
+    low, high = min(values), max(values)
+    span = (high - low) or 1
+    return [(ticks[int((v - low) / span * (len(ticks) - 1))], v) for v in values]
+
+
+def wrap_items(items, room, gap='   '):
+    rows, current = [], ''
+    for item in items:
+        joined = current + gap + item if current else item
+        if current and width(joined) > room:
+            rows.append(current)
+            current = item
+        else:
+            current = joined
+    return rows + ([current] if current else [])
+
+
+def trophy_counts(state):
+    counts = dict.fromkeys(('regicide', 'moon', 'clean', 'early', 'focus', 'done', 'verylate', 'mercy', 'prize'), 0)
+    pushes = {}
+    balance = lowest = 0
+    for e in state.live:
+        balance += e.get('c', 0)
+        lowest = min(lowest, balance)
+        kind, why = e['k'], e.get('why', '').split('+')
+        if kind == 'done':
+            counts['done'] += 1
+            for mark in ('regicide', 'moon', 'focus'):
+                counts[mark] += mark in why
+            counts['early'] += 'early' in why
+            counts['verylate'] += 'verylate' in why
+        elif kind == 'clean':
+            counts['clean'] += 1
+        elif kind == 'prize':
+            counts['prize'] += 1
+        elif kind == 'delete':
+            counts['mercy'] += 'mercy' in why
+        elif kind == 'push':
+            pushes[e.get('u')] = pushes.get(e.get('u'), 0) + 1
+    counts['streak'] = state.best
+    counts['pushes'] = max(pushes.values(), default=0)
+    counts['debt'] = -lowest
+    return counts
+
+
+def trophies(state, cfg):
+    """(what you've won, as labels; the one you're nearest, as (label, how far), or None)."""
+    counts = trophy_counts(state)
+    won, nearest, nearest_share = [], None, -1
+    for key, label, metric, need, repeats in TROPHIES:
+        try:
+            need = int(cfg.raw.get(f'trophy.{key}.need', need))
+        except ValueError:
+            pass
+        label = cfg.raw.get(f'trophy.{key}.label', label)
+        if need <= 0:
+            continue
+        have = counts.get(metric, 0)
+        if have >= need:
+            won.append(f'{label} ×{have}' if repeats and have > 1 else label)
+        elif metric != 'debt' and have / need > nearest_share:
+            nearest, nearest_share = (label, need - have), have / need
+    return won, nearest
+
+
+def most_wanted(tasks, state, cfg):
+    """The worst offenders, with the charge against each: [(icon, id, description, charge)]."""
+    now = datetime.now().astimezone()
+    skip = cfg.skip_tags()
+    suspects = []
+    for t in tasks:
+        if set(t.get('tags', ())) & skip:
+            continue
+        uuid = t['uuid']
+        due = parse_ts(t.get('due'))
+        touched = parse_ts(t.get('modified')) or parse_ts(t.get('entry'))
+        future = any(x and x > now for x in map(parse_ts, (t.get('due'), t.get('scheduled'), t.get('wait'))))
+        pushes = state.count_for('push', uuid)
+        cost = -sum(e.get('c', 0) for e in state.live if e.get('u') == uuid and e['k'] == 'rot')
+        charges = []
+        if due and due < now:
+            late = (now.date() - due.date()).days
+            so_far = f', −{cost} so far' if cost else ''
+            when = f"{late} day{'s' if late != 1 else ''} late" if late else 'late today'
+            charges.append((late * 3 + 1, '🍂', f'{when}{so_far}'))
+        if pushes >= 2:
+            charges.append((pushes * 10, '💃', f'pushed {pushes} times'))
+        days = (now.date() - touched.date()).days if touched else 0
+        if not future and days >= cfg.int('fossil-days'):
+            charges.append((days / 10, '🦕', f'{days} days untouched'))
+        if charges:
+            weight, icon, charge = max(charges, key=lambda c: c[0])
+            suspects.append((weight, icon, t.get('id', 0), t.get('description', ''), charge))
+    suspects.sort(key=lambda s: -s[0])
+    return [s[1:] for s in suspects[:cfg.int('most-wanted')]]
+
+
+def last_word(info, cfg):
+    try:
+        said = LAST_WORD.read_text(encoding='utf-8').strip()
+        if said:
+            return said
+    except OSError:
+        pass
+    net = info['yesterday']['net']
+    return cfg.say('recap_good' if net > 0 else 'recap_bad' if net < 0 else 'recap_mixed')
+
+
+def cmd_score():
+    cfg = Config()
+    info = summary(cfg)
+    state = info['state']
+    if not state.entries:
+        print('🎮 No game yet: it starts with your first task action.')
+        return 0
+    style = cfg.get('box')
+    box = BOXES.get(style, BOXES['double'])
+    ascii_only = style == 'ascii'
+    inner = 58
+    color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+    gold, green, red, dim, off = (('\033[33;1m', '\033[32m', '\033[31m', '\033[2m', '\033[0m') if color
+                                  else ('', '', '', '', ''))
+
+    def row(text=''):
+        pad = max(0, inner - width(text) - 2)
+        print(f'{box[3]} {text}{" " * pad} {box[3]}')
+
+    def text_row(text=''):
+        row(fit(text, inner - 2))
+
+    def section(title):
+        head = f'{box[7]} {title} '
+        print(box[6] + head + box[7] * (inner - width(head)) + box[8])
+
+    where = ' · '.join(x for x in (cfg.station(), today().strftime('%a %-d %b')) if x)
+    if ascii_only:
+        print(f'=== THE SCORE ===   {where}')
+    else:
+        print(f'{gold}{BANNER[0]}{off}')
+        print(f'{gold}{BANNER[1]}{off}   {dim}🎮 {where}{off}')
+    print(box[0] + box[1] * inner + box[2])
+    text_row(f"⭐ LEVEL {info['level']} · {info['rank']}")
+    meter = bar(info['xp'], info['low'], info['next'])
+    if ascii_only:
+        meter = meter.replace('▓', '#').replace('░', '.')
+    target = info['next'] if info['next'] is not None else info['xp']
+    text_row(f"XP {meter} {info['xp']}/{target}")
+    ranks = cfg.ranks()
+    upcoming = next((title for need, title in ranks if need == info['next']), None)
+    text_row(f'   next: {upcoming}' if upcoming else '   The top of the ladder. There is no more ladder.')
+    coins = signed(info['coins']) if info['coins'] < 0 else str(info['coins'])
+    run = f"{info['streak']} day{'' if info['streak'] == 1 else 's'}"
+    text_row(f"🪙 {coins} coins      🔥 {run}      🏅 best {info['best']}"
+             f"{'     🏖️ paused' if info['paused'] else ''}")
+
+    section('LAST 14 DAYS')
+    days = [(today() - timedelta(days=n)).isoformat() for n in range(13, -1, -1)]
+    nets = [tally(state.live, d)['net'] for d in days]
+    glyphs = ''
+    for glyph, value in spark(nets):
+        if ascii_only:
+            glyph = '+' if value > 0 else '-' if value < 0 else '.'
+        tone = green if value > 0 else red if value < 0 else dim
+        glyphs += f'{tone}{glyph}{off}'
+    row(f'{glyphs}  best {signed(max(nets))} · worst {signed(min(nets))} · net {signed(sum(nets))}')
+    text_row(f"Today: {signed(info['today']['net'])}   Yesterday: {signed(info['yesterday']['net'])}")
+
+    section('TROPHY CASE')
+    won, nearest = trophies(state, cfg)
+    for line in wrap_items(won, inner - 2) or ['Empty. The cabinet is dusted and waiting.']:
+        text_row(line)
+    if nearest:
+        text_row(f'🔒 Next: {nearest[0]} ({nearest[1]} to go)')
+
+    tasks = export('status:pending')
+    if tasks is not None:
+        section('MOST WANTED')
+        wanted = most_wanted(tasks, state, cfg)
+        for icon, number, desc, charge in wanted:
+            label = f'{icon} #{number} '
+            room = inner - 2 - width(label) - width(charge) - 2
+            desc = fit(desc, max(room, 6))
+            gap = ' ' * max(1, inner - 2 - width(label) - width(desc) - width(charge))
+            text_row(f'{label}{desc}{gap}{charge}')
+        if not wanted:
+            text_row('Nobody. The streets are safe.')
+
+    section('SHOP')
+    items = []
+    for key, (cost, label) in sorted(info['prizes'].items(), key=lambda item: item[1][0]):
+        icon = label.split()[0] if label.split() and not label.split()[0].isascii() else ''
+        mark = '✅' if 0 <= cost <= info['coins'] else '🔒'
+        items.append(' '.join(x for x in (mark, icon, key, str(cost)) if x))
+    if info['coins'] < 0:
+        text_row("🚫 Shut until you're out of debt.")
+    for line in wrap_items(items, inner - 2):
+        text_row(line)
+    print(box[4] + box[1] * inner + box[5])
+
+    said = last_word(info, cfg)
+    if said:
+        icon = VOICE_ICONS.get(cfg.get('voice'), '🎮')
+        print(f' {icon} "{said}"')
     return 0
 
 
@@ -1268,7 +1581,7 @@ def main(argv):
         return run_hook(argv[1], argv[2:])
     head = argv[0] if argv else ''
     rest = argv[1:]
-    if not argv or head in ('status', 'score'):
+    if not argv or head == 'status':
         return cmd_status()
     if head in ('-h', '--help', 'help'):
         print(__doc__.strip().split('\n\nVersion')[0])
@@ -1277,7 +1590,8 @@ def main(argv):
         print(f'gamify {VERSION}')
         return 0
     commands = {
-        '--refresh': lambda: cmd_refresh(), '--line': cmd_line, '--json': cmd_json, 'shop': cmd_shop,
+        '--refresh': lambda: cmd_refresh(), '--recap': cmd_recap, '--line': cmd_line, '--json': cmd_json, 'shop': cmd_shop,
+        'score': cmd_score,
         'resume': cmd_resume, '-e': cmd_edit, '--edit': cmd_edit,
         'log': lambda: cmd_log(rest), 'redeem': lambda: cmd_redeem(rest), 'pause': lambda: cmd_pause(rest),
     }

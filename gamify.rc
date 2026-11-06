@@ -8,7 +8,10 @@ gamify.enabled          = yes           # no = paused: nothing scored or judged,
 gamify.voice            = grandmother   # grandmother | coach | sergeant | commentator
 gamify.volume           = normal        # off | quiet (fanfares only) | normal (one line) | loud (+ totals)
 gamify.zero-quip-chance = 0.2           # how often a no-points action gets a remark anyway (0 to 1)
-gamify.box              = double        # the board's border: double | single | ascii
+gamify.box              = double        # the boards' border: double | single | ascii
+gamify.spool-clients    = vit           # clients that hide hook output get fanfares by their spool,
+                                        # as a yes/no offer to open the scoreboard (empty = never)
+gamify.most-wanted      = 3             # how many offenders the scoreboard names
 
 # ── Doing things ──────────────────────────────────────────────────────────────
 # A finished task pays: points.done x urgency factor x punctuality factor, then the bonuses.
@@ -73,6 +76,11 @@ gamify.prize.donut.cost    = 150
 gamify.prize.donut.label   = 🍩 One (1) sweet treat
 gamify.prize.nap.cost      = 250
 gamify.prize.nap.label     = 😴 A nap, on purpose
+
+# ── Trophies (gamify score): .need how many it takes (0 retires it), .label its name
+# regicide moon clean early focus century week month archaeologist undertaker spender waltz debtor
+#gamify.trophy.week.need   = 5
+#gamify.trophy.debtor.need = 0
 
 # ── Ranks: gamify.rank.<xp> = title. Any at all replace the built-in twelve. ──
 #gamify.rank.0    = Intern of Intentions
